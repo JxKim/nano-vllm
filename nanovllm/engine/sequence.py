@@ -23,6 +23,8 @@ class Sequence:
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
         self.num_cached_tokens = 0
+        # 这个序列的第0个块，第1个块，第二个块等，分别放在KV Cache的哪个block
+        # 1个KV Cache block 可以存256个token，具体见config.py
         self.block_table = []
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens

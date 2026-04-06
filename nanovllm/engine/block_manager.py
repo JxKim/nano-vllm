@@ -1,3 +1,14 @@
+"""
+这个文件不是在分配 GPU K/V tensor 本体，而是在维护一套“block 元数据管理系统”：
+
+哪些 block 空闲
+哪些 block 被用了
+哪些 block 可被 prefix cache 复用
+每个请求对应哪些 block
+decode 时怎么按 block 扩展
+请求结束时怎么按引用计数回收
+"""
+
 from collections import deque
 import xxhash
 import numpy as np
@@ -9,8 +20,11 @@ class Block:
 
     def __init__(self, block_id):
         self.block_id = block_id
+        # 有多少序列正在引用这个block，主要是为了prefix cache复用
         self.ref_count = 0
+        # 这个block对应的token内容的哈希值
         self.hash = -1
+        # 这个block对应的token列表，用来进一步校验哈希命中是不是假阳性，所以它更像是“页表项”，不是“页内容”
         self.token_ids = []
 
     def update(self, hash: int, token_ids: list[int]):
@@ -34,8 +48,13 @@ class BlockManager:
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
+        """
+        计算token_ids的哈希值，考虑前缀prefix。
+        此处的prefix是上一个block的哈希值，用于实现前缀链式哈希。
+        """
         h = xxhash.xxh64()
         if prefix != -1:
+            # 计算哈希值时，需要将前缀也考虑进去，从而形成前缀链式哈希
             h.update(prefix.to_bytes(8, "little"))
         h.update(np.array(token_ids).tobytes())
         return h.intdigest()
@@ -54,6 +73,9 @@ class BlockManager:
         self.free_block_ids.append(block_id)
 
     def can_allocate(self, seq: Sequence) -> bool:
+        """
+        如果一个新序列需要seq.num_blocks个block，那空闲的block数必须足够，这是prefill前的准入检查
+        """
         return len(self.free_block_ids) >= seq.num_blocks
 
     def allocate(self, seq: Sequence):
@@ -94,6 +116,9 @@ class BlockManager:
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
 
     def may_append(self, seq: Sequence):
+        """
+        decode时的追加是“页式扩展”，而不是“整体重拷贝”
+        """
         block_table = seq.block_table
         last_block = self.blocks[block_table[-1]]
         if len(seq) % self.block_size == 1:

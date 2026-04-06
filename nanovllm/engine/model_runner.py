@@ -1,3 +1,13 @@
+"""
+ModelRunner 的主职责，可以概括成：
+
+把调度器选出来的 Sequence 批次整理成模型真正能吃的输入
+分别准备 prefill 和 decode 所需的上下文信息
+执行模型前向
+根据 logits 做采样
+返回这一轮生成的 token
+"""
+
 import pickle
 import torch
 import torch.distributed as dist
@@ -18,11 +28,15 @@ class ModelRunner:
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
+        # eager_mode 是否开启：代码写一行就执行一行，比较直观，方便调试
+        # 非eager模式：通过会配合图优化、编译、CUDA Graph之类机制，把执行过程提前固化或者优化，追求更高性能
         self.enforce_eager = config.enforce_eager
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
-
+        # 先启动多个python进程，然后用torch.distributed把这些进程拉进同一个通信群，让多个进程可以互相通信，同步和做张量交换
+        # world_size:表示总共有多少个进程参与这个组
+        # rank: 表示我是 第几个进程
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
@@ -32,11 +46,15 @@ class ModelRunner:
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
+        # 根据当前显存余量，计算最多能分多少KV cache block，然后真正申请一大块cache张量，并挂到各层attention模块上
         self.allocate_kv_cache()
         if not self.enforce_eager:
+            # 要追求性能，就把decode图提前录下来
             self.capture_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
+
+        # 当tensor_parallel_size>1时，让rank 0 主进程和其他worker进程通过“共享内存”传命令
 
         if self.world_size > 1:
             if rank == 0:
@@ -83,12 +101,26 @@ class ModelRunner:
             event.set()
 
     def call(self, method_name, *args):
+        """
+        1、如果是多卡场景下的主进程，就先把命令广播给其他rank
+        2、然后当前进程自己也执行同名方法
+        """
+        assert self.world_size > 1 and self.rank == 0
         if self.world_size > 1 and self.rank == 0:
             self.write_shm(method_name, *args)
         method = getattr(self, method_name, None)
         return method(*args)
 
     def warmup_model(self):
+        """
+        为什么要预热
+        很多 GPU 推理代码第一次跑时，往往不是纯粹的正式计算，还会顺带发生这些事情：
+
+        CUDA runtime 初始化
+        某些 kernel 第一次加载或选择最优实现
+        PyTorch/底层库申请一些临时显存
+        attention 路径第一次建立内部状态
+        """
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
@@ -98,6 +130,10 @@ class ModelRunner:
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
+        """
+        先估算当前这张卡还能拿出多少显存给KV Cache
+        再根据一个block要站多少字节，算出最多能分成多少个kvcache_block
+        """
         config = self.config
         hf_config = config.hf_config
         free, total = torch.cuda.mem_get_info()
@@ -118,18 +154,30 @@ class ModelRunner:
                 layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):
+        """
+        每个请求各自用了哪些KV cache block整理成 GPU 能批量处理的统一表格
+        单个seq.block_table是一个请求自己的地址表
+        prepare_block_tables()是把一批请求的地址表拼成batch版地址表
+        """
         max_len = max(len(seq.block_table) for seq in seqs)
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
 
     def prepare_prefill(self, seqs: list[Sequence]):
+        """
+        Sequence是python侧的请求对象，而prepare_prefill()是把这些对象打包成GPU真正能吃的格式
+        它最终产出两类东西：
+        1、直接喂给模型的：input_ids, postions
+        2、喂给attention/KV Cache的辅助信息：cu_seqlens_q, cu_seqlens_k, slot_mapping, block_tables
+        """
         input_ids = []
         positions = []
         cu_seqlens_q = [0]
         cu_seqlens_k = [0]
         max_seqlen_q = 0
         max_seqlen_k = 0
+        # slot_mapping是每个token对应的KV Cache block的起始地址
         slot_mapping = []
         block_tables = None
         for seq in seqs:
@@ -188,6 +236,12 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+        """
+        prefill或不适合图重放时，走普通前向
+        小batch的decode，走CUDA Graph加速
+        """
+        # prefill 阶段通常 token 数多、形状更动态，不太适合 CUDA Graph
+        # self.enforce_eager，用户强制要求用eager模式，那就不要图优化
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             return self.model.compute_logits(self.model(input_ids, positions))
         else:

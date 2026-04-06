@@ -29,6 +29,7 @@ class Qwen3Attention(nn.Module):
         tp_size = dist.get_world_size()
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
+        # 每个TP负责的head数量，也就是tensor parallel的head数量
         self.num_heads = self.total_num_heads // tp_size
         self.total_num_kv_heads = num_kv_heads
         assert self.total_num_kv_heads % tp_size == 0
