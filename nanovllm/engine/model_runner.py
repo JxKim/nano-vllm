@@ -132,7 +132,7 @@ class ModelRunner:
     def allocate_kv_cache(self):
         """
         先估算当前这张卡还能拿出多少显存给KV Cache
-        再根据一个block要站多少字节，算出最多能分成多少个kvcache_block
+        再根据一个block要占多少字节，算出最多能分成多少个kvcache_block
         """
         config = self.config
         hf_config = config.hf_config
@@ -171,6 +171,22 @@ class ModelRunner:
         它最终产出两类东西：
         1、直接喂给模型的：input_ids, postions
         2、喂给attention/KV Cache的辅助信息：cu_seqlens_q, cu_seqlens_k, slot_mapping, block_tables
+
+这里走的是 变长序列的 prefill 路径，它为了配合 flash-attn 的 varlen 接口，不是把输入整理成常见的二维张量 [batch_size, seq_len]，而是把所有序列的 token 拼成一条一维流，再额外用 cu_seqlens 告诉模型“每条序列从哪里开始、到哪里结束”
+    prefill 阶段最常见的情况就是：
+
+Seq1 长 120 token
+Seq2 长 45 token
+Seq3 长 300 token
+如果你硬要做成 [batch_size, seq_len]，那就得：
+
+pad 到同样长度
+产生很多无效 token
+还会增加额外计算和显存浪费
+而这个项目使用的是 flash_attn_varlen_func，它就支持一种更高效的方式：
+
+直接把所有 token 展平
+再用 cu_seqlens_q / cu_seqlens_k 标明边界
         """
         input_ids = []
         positions = []
@@ -193,12 +209,20 @@ class ModelRunner:
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
             if not seq.block_table:    # warmup
                 continue
+            # 假设token_ids = [101, 102, 103, 104, 105, 106]，block_size=4
+            # 第0块：[101,102,103,104]
+            # 第1块：[105,106]
+            # 
+            # 如果block_table=[7,2]，第0块写到block7，也就是槽位：28,29,30,31
+            # 第1块写到block2,也就是槽位8,9
             for i in range(seq.num_cached_blocks, seq.num_blocks):
+                
                 start = seq.block_table[i] * self.block_size
                 if i != seq.num_blocks - 1:
                     end = start + self.block_size
                 else:
-                    end = start + seq.last_block_num_tokens 
+                    end = start + seq.last_block_num_tokens
+                # slot_mapping维护的是每个token的kv，具体写入到哪个 KV Cache Block当中去 
                 slot_mapping.extend(list(range(start, end)))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
@@ -207,6 +231,7 @@ class ModelRunner:
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        # 构建一个计算时所使用到的上下文对象
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
         return input_ids, positions
 

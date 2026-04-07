@@ -25,7 +25,13 @@ class Sequence:
         self.num_cached_tokens = 0
         # 这个序列的第0个块，第1个块，第二个块等，分别放在KV Cache的哪个block
         # 1个KV Cache block 可以存256个token，具体见config.py
-        self.block_table = []
+        # 存的：当前分配给这个seq的block_id：[7,2,3]
+        # 假设 block_size为4，
+        # 当前seq token_ids：[101,102,103,104,105,106,107,108,109,110]
+        # 前四个token,101,102,103,104 他们生成的KV Cache存在block id 为7的这部分显存空间里面
+        # 后四个token,105,106,107,108 他们生成的KV Cache存在block id 为2的这部分显存空间里面
+        # 最后的两个token:109,110 他们生成的KV Cache存在block id 为3的这部分显存空间里面
+        self.block_table = [] 
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
@@ -58,6 +64,7 @@ class Sequence:
 
     @property
     def num_blocks(self):
+        "根据当前的Seq的tokens数，计算一下，需要多少个block"
         return (self.num_tokens + self.block_size - 1) // self.block_size
 
     @property

@@ -16,6 +16,7 @@ class Context:
 _CONTEXT = Context()
 
 def get_context():
+    # 这次前向传播的全局的上下文对象
     return _CONTEXT
 
 def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0, max_seqlen_k=0, slot_mapping=None, context_lens=None, block_tables=None):
