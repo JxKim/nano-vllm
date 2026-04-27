@@ -39,9 +39,10 @@ class Scheduler:
         """
         # prefill
         scheduled_seqs = []
-        num_seqs = 0
         num_batched_tokens = 0
-        while self.waiting and num_seqs < self.max_num_seqs:
+
+        # prefill
+        while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.waiting[0]
             # 做两项检查：1. 批量大小是否超过最大限制；2. 是否有足够的内存分配给该序列
             if num_batched_tokens + len(seq) > self.max_num_batched_tokens or not self.block_manager.can_allocate(seq):
@@ -55,11 +56,12 @@ class Scheduler:
             self.running.append(seq)
             # 将该序列添加到已调度序列列中
             scheduled_seqs.append(seq)
+
         if scheduled_seqs:
             return scheduled_seqs, True
 
         # decode
-        while self.running and num_seqs < self.max_num_seqs:
+        while self.running and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.running.popleft()
             while not self.block_manager.can_append(seq):
                 if self.running:
@@ -68,7 +70,8 @@ class Scheduler:
                     self.preempt(seq)
                     break
             else:
-                num_seqs += 1
+                seq.num_scheduled_tokens = 1
+                seq.is_prefill = False
                 self.block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
         assert scheduled_seqs   
@@ -87,6 +90,7 @@ class Scheduler:
         当 decode 阶段 KV cache 空间不够时，先把某个 running 请求踢回 waiting，并释放它占用的 block，从而给其它请求腾出继续执行的空间
         """
         seq.status = SequenceStatus.WAITING
+        seq.is_prefill = True
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
